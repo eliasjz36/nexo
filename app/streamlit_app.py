@@ -110,7 +110,8 @@ with st.sidebar:
     c2.metric("Hipótesis", e["hipotesis"])
 
     st.divider()
-    solo_beneficio = st.checkbox("Solo hipótesis de beneficio", value=False)
+    solo_beneficio = st.checkbox("Solo las que se oponen al blanco (posible beneficio)",
+                                 value=False)
     solo_sobrevive = st.checkbox("Solo las que superaron al escéptico", value=False)
 
 # ── lista de hipótesis ─────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ consulta = """
     SELECT h.*, v.veredicto FROM hipotesis h
     LEFT JOIN veredictos v ON v.hipotesis_id = h.id WHERE 1=1"""
 if solo_beneficio:
-    consulta += " AND h.tipo='beneficio'"
+    consulta += " AND h.tipo='opuesto'"
 if solo_sobrevive:
     consulta += " AND v.veredicto='sobrevive'"
 consulta += " ORDER BY h.score DESC LIMIT 50"
@@ -150,11 +151,15 @@ registrar(f"ver:hipotesis={hid}:{h['a']}=>{h['b']}")
 
 with col_detalle:
     st.subheader(f"{h['a']}  ⇒  {h['b']}")
-    tipo_txt = ("podría **beneficiar** (se opone al proceso)"
-                if h["tipo"] == "beneficio" else
-                "podría **agravar** (empuja el proceso)")
-    st.markdown(f"Hipótesis: **{h['a']}** {tipo_txt} a **{h['b']}**. "
-                f"Los dos conceptos **nunca aparecen juntos** en el corpus.")
+    if h["tipo"] == "opuesto":
+        tipo_txt = ("actuaría en sentido **opuesto** a **{b}** — si el blanco es "
+                    "una patología o proceso dañino, sugiere un posible beneficio")
+    else:
+        tipo_txt = ("actuaría en el **mismo sentido** que **{b}** — si el blanco "
+                    "es un fármaco, sugiere un efecto similar; si es una "
+                    "patología, un posible riesgo")
+    st.markdown(f"Hipótesis: **{h['a']}** " + tipo_txt.format(b=h["b"]) +
+                f". Los dos conceptos **nunca aparecen juntos** en el corpus.")
 
     # novedad
     st.markdown("##### Novedad")
@@ -163,9 +168,11 @@ with col_detalle:
               if h["pubmed_pre2014"] is not None else "—")
     n2.metric("Papers juntos hoy", h["pubmed_total"]
               if h["pubmed_total"] is not None else "—")
-    if (h["pubmed_pre2014"] == 0 and (h["pubmed_total"] or 0) > 0):
-        n3.success("★ Redescubrimiento: la conexión no existía al corte "
-                   "y hoy está publicada.")
+    pre, tot = h["pubmed_pre2014"], h["pubmed_total"]
+    if pre is not None and tot and tot >= 50 and pre * 20 <= tot:
+        n3.success(f"★ Redescubrimiento: al corte casi no había literatura "
+                   f"conjunta ({pre} papers) y hoy hay {tot}. El sistema "
+                   f"encontró la conexión antes de poder leerla.")
     if n3.button("🔄 Re-chequear novedad en PubMed (en vivo)"):
         try:
             vivo = contar_pubmed_vivo(h["a"], h["b"])
