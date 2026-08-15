@@ -77,6 +77,41 @@ comparable a las herramientas estándar del área (SemRep ronda 0,70-0,75).
 **Velocidad medida**: ~5,7 s/abstract secuencial, ~1,9 s/abstract con 4 slots paralelos
 en la RTX 5070 Ti → corpus completo en ~1 hora, costo $0.
 
+**Qué falló #4 — el hallazgo más importante del proyecto: el extractor inyectó
+conocimiento del futuro.** Inspeccionando las hipótesis apareció una arista imposible:
+"sglt2 inhibition trata heart failure" en papers de **química sintética de 2008-2011**
+que jamás mencionan la enfermedad. El modelo local *sabe* (por su pre-entrenamiento,
+que incluye literatura post-2015) que los SGLT2i tratan la falla cardíaca, y lo
+"extrajo" como si estuviera en el texto. En un experimento con corte temporal, eso es
+contaminación del futuro — el riesgo metodológico conocido de evaluar LBD con LLMs.
+La defensa quedó en dos capas dentro del paso 3: (0a) la frase de respaldo debe existir
+textualmente en el abstract (mató 1.114 relaciones, 10%), y (0b) sujeto y objeto deben
+estar anclados al texto del paper — porque el modelo aprendió a citar frases reales
+pero atribuirles entidades inventadas (mató 792 más, 7%). El grafo final solo contiene
+relaciones verificables contra su fuente: 9.271 aristas.
+
+**RESULTADO DEL EXPERIMENTO (2026-08-15).** Con el corpus congelado en 2013:
+- La hipótesis **«sglt2 inhibition ⇒ heart failure» (sentido opuesto = posible
+  beneficio) emergió en el puesto #13 de 772**, vía dos puentes mecanísticos
+  (hipertensión y diabetes).
+- Verificación contra PubMed: **0 papers** co-mencionaban ambos términos hasta 2013;
+  hoy hay **225** → redescubrimiento confirmado por corte temporal.
+- Las tres primeras hipótesis del ranking dicen que la inhibición SGLT2 actúa **en el
+  mismo sentido que captopril, furosemida y tolvaptán** — los fármacos del tratamiento
+  de la insuficiencia cardíaca. El sistema encontró la conexión por dos ángulos.
+- El agente escéptico calificó la hipótesis estrella como "dudosa", aceptando los
+  puentes de hipertensión/diabetes pero atacando un tercer puente mal extraído
+  (natriuresis con signo invertido) con una contradicción del propio grafo. Es el
+  comportamiento deseado: en 2013 un revisor riguroso habría dicho exactamente eso.
+
+**Smoke test de toda la cadena con datos parciales.** En vez de esperar la hora de
+extracción completa, se corrió el pipeline aguas abajo (normalización → grafo →
+hipótesis → app) con el 13% del corpus ya extraído. Sirvió: la maquinaria completa
+funciona, y el test automatizado de la app (`tests/test_app.py`, con el framework
+AppTest de Streamlit, sin navegador) **cazó un bug real** — la app leía la tabla
+`feedback` antes de que existiera. Ese es el argumento de por qué se testea antes de
+tener "todos los datos".
+
 **Qué falló #3**: el servidor LLM no levantaba — el puerto 8080 ya estaba ocupado por
 un SearXNG local. Movido a 8090. Detalle tonto, pero es el tipo de cosa que consume
 tiempo real de desarrollo y que ningún plan anticipa.

@@ -38,7 +38,7 @@ PROMPT = """Sos un revisor científico escéptico. Tu trabajo es intentar REFUTA
 siguiente hipótesis, no confirmarla. Solo si no encontrás forma sólida de tumbarla, \
 declarala "sobrevive".
 
-HIPÓTESIS: {a} podría tener un efecto de tipo "{tipo}" sobre {b}.
+HIPÓTESIS: «{a}» {tipo_desc} «{b}».
 (Los dos conceptos nunca fueron estudiados juntos en el corpus; la conexión surge de \
 los puentes de abajo.)
 
@@ -97,9 +97,12 @@ def evaluar(con, hid: int) -> dict:
     a, b, tipo = con.execute(
         "SELECT a, b, tipo FROM hipotesis WHERE id=?", (hid,)).fetchone()
     evidencia, contradicciones = evidencia_de(con, hid)
+    tipo_desc = ("actuaría en sentido OPUESTO al proceso o efecto de"
+                 if tipo == "opuesto" else
+                 "actuaría en el MISMO sentido que")
     r = requests.post(f"{SERVER}/v1/chat/completions", json={
         "messages": [{"role": "user", "content": PROMPT.format(
-            a=a, b=b, tipo=tipo, evidencia=evidencia,
+            a=a, b=b, tipo_desc=tipo_desc, evidencia=evidencia,
             contradicciones=contradicciones)}],
         "response_format": {"type": "json_schema",
                             "json_schema": {"name": "v", "schema": SCHEMA}},

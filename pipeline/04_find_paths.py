@@ -154,13 +154,16 @@ def generar(con):
         prod = sum(p["producto"] for p in puentes)
         if prod == 0:
             continue
-        tipo = "beneficio" if prod < 0 else "riesgo"
+        # "opuesto": A empuja contra la dirección de B (si B es una patología,
+        # sugiere beneficio). "mismo_sentido": A actúa como B (si B es un
+        # fármaco, sugiere efecto similar; si es una patología, riesgo).
+        tipo = "opuesto" if prod < 0 else "mismo_sentido"
         papers = set()
         for p in puentes:
             papers.update(p["pmids_1"])
             papers.update(p["pmids_2"])
         # score: convergencia de puentes con el signo mayoritario + evidencia total
-        coherentes = [p for p in puentes if (p["producto"] < 0) == (tipo == "beneficio")]
+        coherentes = [p for p in puentes if (p["producto"] < 0) == (tipo == "opuesto")]
         score = len(coherentes) * 10 + len(papers)
         cur = con.execute(
             "INSERT INTO hipotesis (a,b,tipo,n_puentes,n_papers,score)"
@@ -207,7 +210,9 @@ def novedad(con, top: int):
             con.execute("UPDATE hipotesis SET pubmed_pre2014=?, pubmed_total=? "
                         "WHERE id=?", (pre, total, hid))
             con.commit()
-            marca = "★ REDESCUBRIMIENTO" if pre == 0 and total > 0 else ""
+            # redescubrimiento: casi nada publicado al corte y mucho después
+            marca = ("★ REDESCUBRIMIENTO" if total >= 50 and pre * 20 <= total
+                     else "")
             print(f"  {a} + {b}: pre-2014={pre}, hoy={total}  {marca}")
         except Exception as e:
             print(f"  ERROR {a}+{b}: {e}")
