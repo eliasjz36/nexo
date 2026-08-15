@@ -27,6 +27,13 @@ st.set_page_config(page_title="NEXO", page_icon="🔗", layout="wide")
 def conexion():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
+    # tablas que el pipeline crea en pasos posteriores: si aún no existen,
+    # la app debe funcionar igual (robustez, no crashear por orden de corrida)
+    con.execute("""CREATE TABLE IF NOT EXISTS veredictos (
+        hipotesis_id INTEGER PRIMARY KEY, veredicto TEXT, mecanismo TEXT,
+        a_favor TEXT, en_contra TEXT, modelo TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS feedback (
+        hipotesis_id INTEGER PRIMARY KEY, valor TEXT, ts TEXT)""")
     return con
 
 
