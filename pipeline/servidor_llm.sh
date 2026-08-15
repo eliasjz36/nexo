@@ -5,4 +5,4 @@
 #   -np 4     : 4 pedidos en paralelo (los abstracts son cortos)
 exec /home/elias/llama.cpp/build-cuda/bin/llama-server \
   -m /home/elias/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf \
-  -ngl 99 -c 16384 -np 4 --port 8080 --host 127.0.0.1
+  -ngl 99 -c 16384 -np 4 --port 8090 --host 127.0.0.1

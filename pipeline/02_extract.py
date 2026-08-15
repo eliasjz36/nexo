@@ -20,7 +20,7 @@ from pathlib import Path
 import requests
 
 DB = Path(__file__).resolve().parent.parent / "data" / "corpus.db"
-SERVER = "http://127.0.0.1:8080"
+SERVER = "http://127.0.0.1:8090"
 MODELO = "qwen2.5-14b-instruct-q4km"
 
 # Tipos de relación y su signo para la composición de cadenas (paso 4).
@@ -62,14 +62,23 @@ Extract the explicit relations stated in the abstract below.
 Rules:
 - Only extract relations EXPLICITLY stated in the text. Never use your own \
 background knowledge.
-- "sujeto" and "objeto": short canonical biomedical terms in English, lowercase, \
-singular, abbreviations expanded ("heart failure", not "HF"; "sglt2 inhibition", \
-not "SGLT2i"). 1 to 4 words. No dosages, no percentages.
-- "relacion" meanings: aumenta = subject increases/raises object; reduce = \
-decreases/lowers; causa = causes/leads to/induces; previene = prevents; trata = \
-treats or improves a disease/condition; inhibe = inhibits/blocks; se_asocia = \
-associated, direction unclear; no_afecta = the study found NO effect of subject \
-on object (negative finding — do extract these, they matter).
+- "sujeto" and "objeto" MUST be written in ENGLISH (the language of the abstract). \
+Never translate them to Spanish. Use short canonical biomedical terms: lowercase, \
+singular, plain words separated by spaces (never underscores), abbreviations \
+expanded ("heart failure", not "HF"; "sglt2 inhibition", not "SGLT2i"). \
+1 to 4 words. No dosages, no percentages.
+- "relacion" meanings (these labels are in Spanish, keep them exactly as written): \
+aumenta = subject increases/raises object; reduce = decreases/lowers; causa = \
+causes/leads to/induces; previene = prevents; trata = the text reports that the \
+subject TREATS or improves a disease (diagnosing, measuring or detecting a disease \
+is NOT "trata" — skip diagnostic relations entirely); inhibe = inhibits/blocks; \
+se_asocia = associated, direction unclear; no_afecta = the study EXPLICITLY reports \
+that the subject had NO effect on the object (negative finding — extract these, \
+they matter; but if the text says the subject decreased the object, that is \
+"reduce", not "no_afecta").
+- Focus on relations between drugs/interventions, physiological processes, \
+biomarkers and diseases. Skip purely methodological details (lab reagents, assay \
+chemistry, statistical methods).
 - "frase": the exact text fragment (verbatim) that supports the relation.
 - 0 to 8 relations. Quality over quantity: skip speculative statements \
 ("may", "could") unless the results support them.
