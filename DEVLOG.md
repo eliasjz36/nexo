@@ -77,6 +77,14 @@ comparable a las herramientas estándar del área (SemRep ronda 0,70-0,75).
 **Velocidad medida**: ~5,7 s/abstract secuencial, ~1,9 s/abstract con 4 slots paralelos
 en la RTX 5070 Ti → corpus completo en ~1 hora, costo $0.
 
+**Smoke test de toda la cadena con datos parciales.** En vez de esperar la hora de
+extracción completa, se corrió el pipeline aguas abajo (normalización → grafo →
+hipótesis → app) con el 13% del corpus ya extraído. Sirvió: la maquinaria completa
+funciona, y el test automatizado de la app (`tests/test_app.py`, con el framework
+AppTest de Streamlit, sin navegador) **cazó un bug real** — la app leía la tabla
+`feedback` antes de que existiera. Ese es el argumento de por qué se testea antes de
+tener "todos los datos".
+
 **Qué falló #3**: el servidor LLM no levantaba — el puerto 8080 ya estaba ocupado por
 un SearXNG local. Movido a 8090. Detalle tonto, pero es el tipo de cosa que consume
 tiempo real de desarrollo y que ningún plan anticipa.
