@@ -139,8 +139,16 @@ with col_lista:
     if not opciones:
         st.info("No hay hipótesis con esos filtros.")
         st.stop()
+    # ?hip=<id> permite linkear directo a una hipótesis (y compartirla)
+    try:
+        hip_param = int(st.query_params.get("hip", -1))
+    except ValueError:
+        hip_param = -1
+    indice = (list(opciones.values()).index(hip_param)
+              if hip_param in opciones.values() else 0)
     eleccion = st.radio("Elegí una para ver el detalle:",
-                        list(opciones), label_visibility="collapsed")
+                        list(opciones), index=indice,
+                        label_visibility="collapsed")
     hid = opciones[eleccion]
 
 # ── detalle ────────────────────────────────────────────────────────────────
