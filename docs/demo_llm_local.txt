@@ -1,0 +1,11 @@
+======================================================================
+DEMO: LLM local (llama.cpp + Qwen2.5-14B-Instruct) en RTX 5070 Ti
+======================================================================
+GPU: NVIDIA GeForce RTX 5070 Ti, 13055 MiB
+
+PREGUNTA: ¿Qué es el 'conocimiento público no descubierto' de Swanson y cómo lo aprovecha un sistema como NEXO? Respondé en 4-5 líneas.
+
+RESPUESTA DEL MODELO LOCAL:
+El 'conocimiento público no descubierto' de Swanson se refiere a la idea de que hay información útil y desconocida que puede derivarse de la combinación de dos hechos conocidos pero aislados. Un sistema como NEXO explota esta idea al buscar y conectar datos dispersos en la literatura científica para revelar nuevas hipótesis o relaciones potencialmente útiles.
+
+[tokens: 68 entrada, 88 salida — servido en localhost:8090, sin conexión a ningún servicio externo]

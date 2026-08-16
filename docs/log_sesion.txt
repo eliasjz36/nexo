@@ -1,0 +1,12 @@
+REGISTRO DE SESIÓN DE USO — tabla registro_uso de la app
+(cada interacción del usuario queda registrada automáticamente)
+==================================================================
+2026-08-15T18:04:56  ver:hipotesis=1:sglt2 inhibition=>nesiritide
+2026-08-15T18:04:56  ver:hipotesis=1:sglt2 inhibition=>nesiritide
+2026-08-15T18:05:21  ver:hipotesis=1:sglt2 inhibition=>nesiritide
+2026-08-15T18:05:21  ver:hipotesis=1:sglt2 inhibition=>nesiritide
+2026-08-15T19:15:44  ver:hipotesis=434:sglt2 inhibition=>captopril
+2026-08-15T19:15:44  ver:hipotesis=434:sglt2 inhibition=>captopril
+2026-08-16T19:24:08  ver:hipotesis=434:sglt2 inhibition=>captopril
+2026-08-16T19:24:09  ver:hipotesis=451:sglt2 inhibition=>heart failure
+2026-08-16T19:24:47  ver:hipotesis=434:sglt2 inhibition=>captopril
