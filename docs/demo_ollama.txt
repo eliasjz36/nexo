@@ -1,0 +1,19 @@
+======================================================================
+DEMO OPCIONAL: Ollama corriendo localmente (RTX 5070 Ti)
+======================================================================
+
+$ ollama --version
+ollama version is 0.15.5-rc0
+
+$ ollama list
+NAME                        ID              SIZE      MODIFIED       
+qwen2.5-14b-local:latest    fefeb9b19068    9.0 GB    14 seconds ago
+
+PREGUNTA (vía /api/chat): En el patrón A-C-B que usa NEXO: si un fármaco aumenta la natriuresis (C) y la insuficiencia cardíaca cursa con retención de sodio, ¿qué hipótesis se puede plantear y qué habría que verificar antes de tomarla en serio? Respondé en 4-5 líneas.
+
+RESPUESTA:
+Si un fármaco aumenta la natriuresis (C) en pacientes con insuficiencia cardíaca que sufren retención de sodio, se podría plantear la hipótesis de que este tratamiento podría ayudar a reducir la carga hídrica y mejorar el estado clínico del paciente. Sin embargo, antes de tomar esta hipótesis en serio, sería necesario verificar si efectivamente hay una mejora clínica significativa sin provocar desequilibrios eletrolíticos adversos ni empeorar otros síntomas cardíacos.
+
+$ ollama ps
+NAME                        ID              SIZE      PROCESSOR    CONTEXT    UNTIL              
+qwen2.5-14b-local:latest    e528d44823af    9.7 GB    100% GPU     4096       4 minutes from now
