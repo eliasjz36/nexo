@@ -35,5 +35,6 @@ docs/       informe y documentación
 
 ## Enlaces
 
-- App en vivo: *(pendiente de deploy)*
-- Informe: `docs/`
+- **App en vivo:** https://a9katfbde589gdtas3ybxg.streamlit.app
+- **Informe:** [docs/informe_final.pdf](docs/informe_final.pdf)
+- **Registro de desarrollo (co-work con IA):** [DEVLOG.md](DEVLOG.md)
