@@ -77,6 +77,14 @@ comparable a las herramientas estándar del área (SemRep ronda 0,70-0,75).
 **Velocidad medida**: ~5,7 s/abstract secuencial, ~1,9 s/abstract con 4 slots paralelos
 en la RTX 5070 Ti → corpus completo en ~1 hora, costo $0.
 
+**Qué falló #5 (demo de Ollama).** Para el demo opcional se instaló Ollama en modo
+usuario y se importó el mismo GGUF del pipeline vía Modelfile (sin re-descargar 9 GB).
+Primer intento: el modelo divagaba y no cortaba — al importar un GGUF crudo, Ollama no
+aplica la plantilla de chat y el modelo ve texto plano. Se resolvió declarando la
+plantilla ChatML de Qwen y sus tokens de parada en el Modelfile. El mismo archivo,
+servido con llama.cpp, había funcionado directo: cada runtime tiene sus propias
+fricciones, y esa es parte de la lección de operar LLMs propios.
+
 **Qué falló #4 — el hallazgo más importante del proyecto: el extractor inyectó
 conocimiento del futuro.** Inspeccionando las hipótesis apareció una arista imposible:
 "sglt2 inhibition trata heart failure" en papers de **química sintética de 2008-2011**
