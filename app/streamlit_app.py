@@ -105,32 +105,49 @@ def llm_disponibles() -> int:
     return max(0, MAX_LLM_POR_SESION - usados)
 
 
-def gemini(prompt: str, contar: bool = True) -> str | None:
+def gemini(prompt: str, contar: bool = True,
+           max_tokens: int = 1200) -> str | None:
     """Llamada a Gemini. `contar=False` para las exploraciones en vivo, que
-    llevan su propio límite por sesión. Devuelve None si no se puede."""
+    llevan su propio límite por sesión. Maneja el límite por minuto de la
+    capa gratuita (429 → espera y reintenta) y desactiva el razonamiento
+    interno de los modelos 2.5 para no quemar tokens de salida."""
     if not hay_llm() or (contar and llm_disponibles() <= 0):
         return None
     key = clave_llm()
     for modelo in ("gemini-2.5-flash", "gemini-2.0-flash"):
-        try:
-            r = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{modelo}:generateContent",
-                params={"key": key},
-                json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.4,
-                                           "maxOutputTokens": 900}},
-                timeout=60)
-            if r.status_code == 404:
+        config = {"temperature": 0.4, "maxOutputTokens": max_tokens}
+        if "2.5" in modelo:
+            config["thinkingConfig"] = {"thinkingBudget": 0}
+        for intento in range(3):
+            try:
+                r = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{modelo}:generateContent",
+                    params={"key": key},
+                    json={"contents": [{"role": "user",
+                                        "parts": [{"text": prompt}]}],
+                          "generationConfig": config},
+                    timeout=90)
+            except requests.RequestException:
+                return None
+            if r.status_code == 429:          # límite por minuto: esperar
+                time.sleep(20)
                 continue
-            r.raise_for_status()
-            partes = r.json()["candidates"][0]["content"]["parts"]
+            if r.status_code == 404:          # modelo no disponible: probar otro
+                break
+            if not r.ok:
+                return None
+            try:
+                partes = r.json()["candidates"][0]["content"]["parts"]
+                texto = " ".join(p.get("text", "") for p in partes).strip()
+            except (KeyError, IndexError):
+                return None
+            if not texto:
+                return None
             if contar:
                 st.session_state["llm_usos"] = \
                     st.session_state.get("llm_usos", 0) + 1
-            return " ".join(p.get("text", "") for p in partes).strip()
-        except requests.RequestException:
-            return None
+            return texto
     return None
 
 
@@ -539,7 +556,7 @@ def extraer_lote_vivo(lote: list[dict]) -> list[dict]:
         "one of: aumenta, reduce, causa, previene, trata, inhibe, se_asocia, "
         "no_afecta. frase = exact verbatim fragment from that abstract. Max 5 "
         "relations per abstract. Skip methodology details.\n\n" + textos)
-    salida = gemini(prompt, contar=False)
+    salida = gemini(prompt, contar=False, max_tokens=6000)
     if not salida:
         return []
     try:
@@ -591,8 +608,10 @@ with tab_v:
         st.caption(f"Exploraciones disponibles en esta sesión: "
                    f"{MAX_EXPLORACIONES - usadas}/{MAX_EXPLORACIONES}. "
                    "Consejo: temas en inglés encuentran más literatura.")
-        if st.button("🌐 Explorar en vivo",
-                     disabled=not (tema_a.strip() and tema_b.strip())):
+        if st.button("🌐 Explorar en vivo"):
+            if not (tema_a.strip() and tema_b.strip()):
+                st.warning("Completá los dos temas antes de explorar.")
+                st.stop()
             st.session_state["exploraciones"] = usadas + 1
             registrar(f"vivo:{tema_a.strip()}×{tema_b.strip()}")
             barra = st.progress(0, text="Bajando papers de PubMed…")
@@ -613,15 +632,29 @@ with tab_v:
                            "PubMed. Probá con otro término (mejor en inglés).")
             else:
                 rel_a, rel_b = [], []
+                fallidos = 0
                 lotes = [(corpus_a[i:i + 8], "a") for i in range(0, len(corpus_a), 8)]
                 lotes += [(corpus_b[i:i + 8], "b") for i in range(0, len(corpus_b), 8)]
                 for k, (lote, lado) in enumerate(lotes):
-                    (rel_a if lado == "a" else rel_b).extend(extraer_lote_vivo(lote))
+                    filas = extraer_lote_vivo(lote)
+                    if not filas:
+                        fallidos += 1
+                    (rel_a if lado == "a" else rel_b).extend(filas)
                     barra.progress(30 + int(60 * (k + 1) / len(lotes)),
                                    text=f"Extrayendo… lote {k + 1}/{len(lotes)} "
                                         f"({len(rel_a) + len(rel_b)} relaciones "
                                         "verificadas)")
-                    time.sleep(4)  # respeto del límite por minuto de la capa gratis
+                    time.sleep(7)  # ≤ 8 llamadas/min: límite de la capa gratuita
+                if fallidos:
+                    st.caption(f"⚠️ {fallidos} de {len(lotes)} lotes no "
+                               "devolvieron relaciones (límite de la capa "
+                               "gratuita del LLM); la cobertura es parcial.")
+                if not rel_a and not rel_b:
+                    barra.empty()
+                    st.error("El LLM no devolvió relaciones. Lo más probable es "
+                             "que la capa gratuita haya alcanzado su límite por "
+                             "minuto o por día — probá de nuevo en unos minutos.")
+                    st.stop()
                 barra.progress(95, text="Buscando puentes…")
 
                 # anclas: entidades que contienen el tema; si no, las más citadas
@@ -630,25 +663,33 @@ with tab_v:
                     for r in rels:
                         ents[r["sujeto"]] += 1
                         ents[r["objeto"]] += 1
-                    con_tema = [e for e in ents if tema.lower() in e]
+                    # matchear por token: "parkinson" encuentra "parkinson's disease"
+                    toks = [t for t in tema.lower().split() if len(t) > 3]
+                    con_tema = [e for e in ents
+                                if any(t in e for t in toks)] if toks else []
                     if con_tema:
-                        return sorted(con_tema, key=ents.get, reverse=True)[:3]
+                        return sorted(con_tema, key=ents.get, reverse=True)[:4]
                     return sorted(ents, key=ents.get, reverse=True)[:3]
 
                 an_a = anclas(rel_a, tema_a.strip())
                 an_b = anclas(rel_b, tema_b.strip())
+
+                def clave_ent(e: str) -> str:
+                    # tolerancia a plurales al cruzar (en vivo no hay MeSH)
+                    return e[:-1] if e.endswith("s") and not e.endswith("ss") else e
+
                 desde_a = defaultdict(list)
                 for r in rel_a:
                     if r["sujeto"] in an_a and r["signo"] != 0:
-                        desde_a[r["objeto"]].append(r)
+                        desde_a[clave_ent(r["objeto"])].append(r)
                 alrededor_b = defaultdict(list)
                 for r in rel_b:
                     if r["signo"] == 0:
                         continue
                     if r["objeto"] in an_b:
-                        alrededor_b[r["sujeto"]].append({**r, "ori": "C→B"})
+                        alrededor_b[clave_ent(r["sujeto"])].append({**r, "ori": "C→B"})
                     if r["sujeto"] in an_b:
-                        alrededor_b[r["objeto"]].append({**r, "ori": "B→C"})
+                        alrededor_b[clave_ent(r["objeto"])].append({**r, "ori": "B→C"})
                 puentes_c = sorted(set(desde_a) & set(alrededor_b))
                 barra.progress(100, text="Listo")
                 barra.empty()
