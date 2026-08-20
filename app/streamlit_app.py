@@ -39,7 +39,10 @@ def conexion():
     con.row_factory = sqlite3.Row
     con.execute("""CREATE TABLE IF NOT EXISTS veredictos (
         hipotesis_id INTEGER PRIMARY KEY, veredicto TEXT, mecanismo TEXT,
-        a_favor TEXT, en_contra TEXT, modelo TEXT)""")
+        a_favor TEXT, en_contra TEXT, como_probar TEXT, modelo TEXT)""")
+    if "como_probar" not in [c[1] for c in
+                             con.execute("PRAGMA table_info(veredictos)")]:
+        con.execute("ALTER TABLE veredictos ADD COLUMN como_probar TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS feedback (
         hipotesis_id INTEGER PRIMARY KEY, valor TEXT, ts TEXT)""")
     return con
@@ -102,9 +105,10 @@ def llm_disponibles() -> int:
     return max(0, MAX_LLM_POR_SESION - usados)
 
 
-def gemini(prompt: str) -> str | None:
-    """Llamada a Gemini con tope por sesión. Devuelve None si no se puede."""
-    if not hay_llm() or llm_disponibles() <= 0:
+def gemini(prompt: str, contar: bool = True) -> str | None:
+    """Llamada a Gemini. `contar=False` para las exploraciones en vivo, que
+    llevan su propio límite por sesión. Devuelve None si no se puede."""
+    if not hay_llm() or (contar and llm_disponibles() <= 0):
         return None
     key = clave_llm()
     for modelo in ("gemini-2.5-flash", "gemini-2.0-flash"):
@@ -121,7 +125,9 @@ def gemini(prompt: str) -> str | None:
                 continue
             r.raise_for_status()
             partes = r.json()["candidates"][0]["content"]["parts"]
-            st.session_state["llm_usos"] = st.session_state.get("llm_usos", 0) + 1
+            if contar:
+                st.session_state["llm_usos"] = \
+                    st.session_state.get("llm_usos", 0) + 1
             return " ".join(p.get("text", "") for p in partes).strip()
         except requests.RequestException:
             return None
@@ -191,8 +197,9 @@ with st.sidebar:
 con = conexion()
 ICONO = {"sobrevive": "✅", "dudosa": "🤔", "refutada": "❌", None: "⏳"}
 
-tab_h, tab_g, tab_d = st.tabs(
-    ["📋 Hipótesis", "🔎 Explorar el grafo", "🧪 Descubrí vos"])
+tab_h, tab_g, tab_d, tab_v = st.tabs(
+    ["📋 Hipótesis", "🔎 Explorar el grafo", "🧪 Descubrí vos",
+     "🌐 NEXO en vivo"])
 
 # ═══════════════════════════════════════════════ TAB 1: HIPÓTESIS
 with tab_h:
@@ -228,7 +235,8 @@ with tab_h:
                             label_visibility="collapsed")
         hid = opciones[eleccion]
 
-    h = con.execute("""SELECT h.*, v.veredicto, v.mecanismo, v.a_favor, v.en_contra
+    h = con.execute("""SELECT h.*, v.veredicto, v.mecanismo, v.a_favor,
+                       v.en_contra, v.como_probar
                        FROM hipotesis h LEFT JOIN veredictos v
                        ON v.hipotesis_id=h.id WHERE h.id=?""", (hid,)).fetchone()
     registrar(f"ver:hipotesis={hid}:{h['a']}=>{h['b']}")
@@ -274,6 +282,10 @@ with tab_h:
             cc.error(f"**En contra:** {h['en_contra']}")
         else:
             st.caption("Esta hipótesis aún no fue evaluada por el agente escéptico.")
+
+        if h["veredicto"] and h["como_probar"]:
+            st.markdown("##### Cómo probarla")
+            st.markdown(f"🧪 {h['como_probar']}")
 
         st.markdown("##### Puentes y evidencia")
         puentes = con.execute(
@@ -479,5 +491,215 @@ with tab_d:
             elif not hay_llm():
                 st.caption("Análisis del LLM no disponible: falta configurar la "
                            "API key en los Secrets del despliegue.")
+
+# ═══════════════════════════════════════════════ TAB 4: NEXO EN VIVO
+MAX_EXPLORACIONES = 2
+SIGNOS_VIVO = {"aumenta": +1, "causa": +1, "reduce": -1, "previene": -1,
+               "trata": -1, "inhibe": -1, "se_asocia": 0, "no_afecta": 0}
+
+
+def _norm(t: str) -> str:
+    import re
+    t = t.lower().replace("’", "'").replace("“", '"').replace("”", '"')
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def pubmed_corpus_vivo(tema: str, n: int = 60) -> list[dict]:
+    """Baja en el momento los n abstracts más relevantes de un tema."""
+    r = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                     params={"db": "pubmed", "term": tema, "retmax": n,
+                             "sort": "relevance"}, timeout=30)
+    r.raise_for_status()
+    ids = [e.text for e in ET.fromstring(r.text).findall(".//Id")]
+    papers = []
+    for i in range(0, len(ids), 100):
+        rf = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+                          params={"db": "pubmed", "id": ",".join(ids[i:i + 100]),
+                                  "retmode": "xml"}, timeout=60)
+        rf.raise_for_status()
+        for art in ET.fromstring(rf.text).findall(".//PubmedArticle"):
+            pmid = art.findtext(".//PMID")
+            trozos = [t.text or "" for t in art.findall(".//Abstract/AbstractText")]
+            abstract = " ".join(trozos).strip()
+            if abstract:
+                papers.append({"pmid": pmid, "abstract": abstract[:1400]})
+        time.sleep(0.4)
+    return papers
+
+
+def extraer_lote_vivo(lote: list[dict]) -> list[dict]:
+    """Extrae relaciones de un lote de abstracts con UNA llamada a Gemini."""
+    textos = "\n\n".join(f"[PMID {p['pmid']}]\n{p['abstract']}" for p in lote)
+    prompt = (
+        "Extract explicit biomedical relations from each abstract below.\n"
+        "Return ONLY a JSON array; one object per abstract that has relations:\n"
+        '[{"pmid": "...", "relaciones": [{"sujeto": "...", "relacion": "...", '
+        '"objeto": "...", "frase": "..."}]}]\n'
+        "Rules: sujeto/objeto in English, lowercase, 1-4 words. relacion must be "
+        "one of: aumenta, reduce, causa, previene, trata, inhibe, se_asocia, "
+        "no_afecta. frase = exact verbatim fragment from that abstract. Max 5 "
+        "relations per abstract. Skip methodology details.\n\n" + textos)
+    salida = gemini(prompt, contar=False)
+    if not salida:
+        return []
+    try:
+        inicio, fin = salida.find("["), salida.rfind("]") + 1
+        datos = json.loads(salida[inicio:fin])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    abstracts = {p["pmid"]: _norm(p["abstract"]) for p in lote}
+    filas = []
+    for item in datos:
+        ab = abstracts.get(str(item.get("pmid", "")), "")
+        for rel in item.get("relaciones", []):
+            if (rel.get("relacion") in SIGNOS_VIVO and rel.get("sujeto")
+                    and rel.get("objeto")
+                    and _norm(rel.get("frase", "")) in ab):  # capa 0 en vivo
+                filas.append({
+                    "pmid": str(item["pmid"]),
+                    "sujeto": rel["sujeto"].strip().lower(),
+                    "objeto": rel["objeto"].strip().lower(),
+                    "relacion": rel["relacion"],
+                    "signo": SIGNOS_VIVO[rel["relacion"]],
+                    "frase": rel["frase"].strip(),
+                })
+    return filas
+
+
+with tab_v:
+    st.subheader("Explorá dos áreas NUEVAS, en vivo")
+    st.caption(
+        "La versión liviana del pipeline completo, ejecutada en el momento: "
+        "baja los ~60 papers más relevantes de cada tema desde PubMed, extrae "
+        "relaciones con el LLM (verificando cada frase contra el abstract) y "
+        "busca puentes con signos coherentes. Tarda 2-4 minutos. Limitación "
+        "honesta: corpus chico y sin la pasada profunda del escéptico — la "
+        "versión completa corre offline.")
+    usadas = st.session_state.get("exploraciones", 0)
+    if not hay_llm():
+        st.info("Esta función necesita la API key del LLM en los Secrets del "
+                "despliegue.")
+    elif usadas >= MAX_EXPLORACIONES:
+        st.info("Límite de exploraciones de esta sesión alcanzado (protección "
+                "de la capa gratuita). Recargá la página para renovar.")
+    else:
+        cta, ctb = st.columns(2)
+        tema_a = cta.text_input("Tema A (fármaco, intervención, molécula…)",
+                                placeholder="ej: melatonin", key="vivo_a")
+        tema_b = ctb.text_input("Tema B (enfermedad, proceso…)",
+                                placeholder="ej: parkinson disease", key="vivo_b")
+        st.caption(f"Exploraciones disponibles en esta sesión: "
+                   f"{MAX_EXPLORACIONES - usadas}/{MAX_EXPLORACIONES}. "
+                   "Consejo: temas en inglés encuentran más literatura.")
+        if st.button("🌐 Explorar en vivo",
+                     disabled=not (tema_a.strip() and tema_b.strip())):
+            st.session_state["exploraciones"] = usadas + 1
+            registrar(f"vivo:{tema_a.strip()}×{tema_b.strip()}")
+            barra = st.progress(0, text="Bajando papers de PubMed…")
+            try:
+                corpus_a = pubmed_corpus_vivo(tema_a.strip())
+                barra.progress(15, text=f"Tema A: {len(corpus_a)} abstracts. "
+                                        "Bajando tema B…")
+                corpus_b = pubmed_corpus_vivo(tema_b.strip())
+                barra.progress(30, text=f"Tema B: {len(corpus_b)} abstracts. "
+                                        "Extrayendo relaciones con el LLM…")
+            except requests.RequestException:
+                barra.empty()
+                st.error("PubMed no respondió. Probá de nuevo en un momento.")
+                st.stop()
+            if not corpus_a or not corpus_b:
+                barra.empty()
+                st.warning("Alguno de los temas no tiene papers con abstract en "
+                           "PubMed. Probá con otro término (mejor en inglés).")
+            else:
+                rel_a, rel_b = [], []
+                lotes = [(corpus_a[i:i + 8], "a") for i in range(0, len(corpus_a), 8)]
+                lotes += [(corpus_b[i:i + 8], "b") for i in range(0, len(corpus_b), 8)]
+                for k, (lote, lado) in enumerate(lotes):
+                    (rel_a if lado == "a" else rel_b).extend(extraer_lote_vivo(lote))
+                    barra.progress(30 + int(60 * (k + 1) / len(lotes)),
+                                   text=f"Extrayendo… lote {k + 1}/{len(lotes)} "
+                                        f"({len(rel_a) + len(rel_b)} relaciones "
+                                        "verificadas)")
+                    time.sleep(4)  # respeto del límite por minuto de la capa gratis
+                barra.progress(95, text="Buscando puentes…")
+
+                # anclas: entidades que contienen el tema; si no, las más citadas
+                def anclas(rels, tema):
+                    ents = defaultdict(int)
+                    for r in rels:
+                        ents[r["sujeto"]] += 1
+                        ents[r["objeto"]] += 1
+                    con_tema = [e for e in ents if tema.lower() in e]
+                    if con_tema:
+                        return sorted(con_tema, key=ents.get, reverse=True)[:3]
+                    return sorted(ents, key=ents.get, reverse=True)[:3]
+
+                an_a = anclas(rel_a, tema_a.strip())
+                an_b = anclas(rel_b, tema_b.strip())
+                desde_a = defaultdict(list)
+                for r in rel_a:
+                    if r["sujeto"] in an_a and r["signo"] != 0:
+                        desde_a[r["objeto"]].append(r)
+                alrededor_b = defaultdict(list)
+                for r in rel_b:
+                    if r["signo"] == 0:
+                        continue
+                    if r["objeto"] in an_b:
+                        alrededor_b[r["sujeto"]].append({**r, "ori": "C→B"})
+                    if r["sujeto"] in an_b:
+                        alrededor_b[r["objeto"]].append({**r, "ori": "B→C"})
+                puentes_c = sorted(set(desde_a) & set(alrededor_b))
+                barra.progress(100, text="Listo")
+                barra.empty()
+
+                st.markdown(f"**Relaciones verificadas:** {len(rel_a)} del tema A, "
+                            f"{len(rel_b)} del tema B · **Anclas:** "
+                            f"{', '.join(an_a)} × {', '.join(an_b)}")
+                if not puentes_c:
+                    st.info("Sin puentes firmados entre las anclas con este "
+                            "corpus chico. No significa que no exista conexión: "
+                            "la versión completa (offline) usa 20 veces más "
+                            "papers. Probá términos más específicos.")
+                else:
+                    st.success(f"{len(puentes_c)} puente(s) encontrados en vivo")
+                    resumen = []
+                    for c in puentes_c[:5]:
+                        e1, e2 = desde_a[c][0], alrededor_b[c][0]
+                        f1 = "↑" if e1["signo"] > 0 else "↓"
+                        f2 = "↑" if e2["signo"] > 0 else "↓"
+                        flecha = "→" if e2["ori"] == "C→B" else "←"
+                        with st.expander(
+                                f"{e1['sujeto']} {f1} → **{c}** {flecha} {f2} "
+                                f"{e2['objeto'] if e2['ori'] == 'C→B' else e2['sujeto']}"):
+                            st.markdown(f"- «{e1['sujeto']}» *{e1['relacion']}* "
+                                        f"«{e1['objeto']}» — [PMID {e1['pmid']}]"
+                                        f"(https://pubmed.ncbi.nlm.nih.gov/{e1['pmid']}/)")
+                            st.caption(f"“{e1['frase']}”")
+                            st.markdown(f"- «{e2['sujeto']}» *{e2['relacion']}* "
+                                        f"«{e2['objeto']}» — [PMID {e2['pmid']}]"
+                                        f"(https://pubmed.ncbi.nlm.nih.gov/{e2['pmid']}/)")
+                            st.caption(f"“{e2['frase']}”")
+                        resumen.append(
+                            f"vía «{c}»: «{e1['sujeto']}» {e1['relacion']} «{c}» "
+                            f'("{e1["frase"][:120]}"); «{e2["sujeto"]}» '
+                            f'{e2["relacion"]} «{e2["objeto"]}» ("{e2["frase"][:120]}")')
+                    try:
+                        juntos = contar_pubmed_vivo(tema_a.strip(), tema_b.strip())
+                        st.metric("Papers que ya mencionan ambos temas (PubMed, "
+                                  "en vivo)", juntos)
+                    except Exception:
+                        juntos = None
+                    analisis = gemini(
+                        f"Un usuario exploró conectar «{tema_a}» con «{tema_b}». "
+                        "Puentes hallados en papers reales:\n" + "\n".join(resumen)
+                        + f"\nPapers que ya co-mencionan ambos: {juntos}.\n"
+                        "En español y conciso: (1) hipótesis en una frase; (2) "
+                        "mecanismo; (3) crítica escéptica honesta; (4) veredicto "
+                        "de novedad según los papers co-mencionantes. Basate solo "
+                        "en la evidencia dada.", contar=False)
+                    if analisis:
+                        st.markdown("#### 🤖 Análisis del LLM")
+                        st.info(analisis)
 
 con.close()

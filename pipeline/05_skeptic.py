@@ -30,8 +30,9 @@ SCHEMA = {
         "mecanismo": {"type": "string"},
         "a_favor": {"type": "string"},
         "en_contra": {"type": "string"},
+        "como_probar": {"type": "string"},
     },
-    "required": ["veredicto", "mecanismo", "a_favor", "en_contra"],
+    "required": ["veredicto", "mecanismo", "a_favor", "en_contra", "como_probar"],
 }
 
 PROMPT = """Sos un revisor científico escéptico. Tu trabajo es intentar REFUTAR la \
@@ -62,6 +63,8 @@ Respondé en español, conciso:
 - "en_contra": el ataque más fuerte que encontraste (máx 2 frases). Si no hay, decilo.
 - "veredicto": "refutada" si el ataque destruye la cadena, "dudosa" si la debilita \
 seriamente, "sobrevive" solo si resiste.
+- "como_probar": el estudio o experimento más directo que confirmaría o refutaría \
+esta hipótesis (1-2 frases concretas: tipo de estudio, qué se mediría).
 """
 
 
@@ -120,7 +123,11 @@ def main():
     con = sqlite3.connect(DB)
     con.execute("""CREATE TABLE IF NOT EXISTS veredictos (
         hipotesis_id INTEGER PRIMARY KEY, veredicto TEXT, mecanismo TEXT,
-        a_favor TEXT, en_contra TEXT, modelo TEXT)""")
+        a_favor TEXT, en_contra TEXT, como_probar TEXT, modelo TEXT)""")
+    # migración: si la tabla vieja no tiene la columna, agregarla
+    cols = [c[1] for c in con.execute("PRAGMA table_info(veredictos)")]
+    if "como_probar" not in cols:
+        con.execute("ALTER TABLE veredictos ADD COLUMN como_probar TEXT")
 
     pendientes = con.execute("""
         SELECT id FROM hipotesis WHERE id NOT IN
@@ -132,9 +139,11 @@ def main():
         try:
             v = evaluar(con, hid)
             con.execute(
-                "INSERT OR REPLACE INTO veredictos VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO veredictos "
+                "(hipotesis_id, veredicto, mecanismo, a_favor, en_contra, "
+                "como_probar, modelo) VALUES (?,?,?,?,?,?,?)",
                 (hid, v["veredicto"], v["mecanismo"], v["a_favor"],
-                 v["en_contra"], MODELO))
+                 v["en_contra"], v["como_probar"], MODELO))
             con.commit()
             print(f"  [{v['veredicto']:9s}] {a} ⇒ {b}")
         except Exception as e:
