@@ -2,16 +2,25 @@
 """
 NEXO — interfaz web.
 
-Lee el grafo y las hipótesis PRECOMPUTADAS por el pipeline (data/corpus.db).
-La app no llama a ningún LLM: por eso puede estar publicada sin API keys y sin
-costo de operación. El único servicio en vivo es el re-chequeo de novedad
-contra PubMed (API pública gratuita).
+Tres modos de uso:
+  1) Hipótesis: explorar las 772 hipótesis precomputadas por el pipeline,
+     con su evidencia, novedad y veredicto del escéptico.
+  2) Explorar el grafo: buscar cualquier concepto y ver sus relaciones.
+  3) Descubrí vos: elegir dos conceptos y buscar puentes EN VIVO, con
+     narración y crítica de un LLM.
+
+El pipeline pesado (extracción con LLM local) corre offline y sus resultados
+viajan en data/corpus.db. La capa viva usa la API gratuita de Gemini con tope
+de uso por sesión; si la key no está configurada, la app funciona igual sin
+esas funciones.
 
 Correr local:  streamlit run app/streamlit_app.py
 """
+import json
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +28,7 @@ import requests
 import streamlit as st
 
 DB = Path(__file__).resolve().parent.parent / "data" / "corpus.db"
+MAX_LLM_POR_SESION = 20
 
 st.set_page_config(page_title="NEXO", page_icon="🔗", layout="wide")
 
@@ -27,8 +37,6 @@ st.set_page_config(page_title="NEXO", page_icon="🔗", layout="wide")
 def conexion():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
-    # tablas que el pipeline crea en pasos posteriores: si aún no existen,
-    # la app debe funcionar igual (robustez, no crashear por orden de corrida)
     con.execute("""CREATE TABLE IF NOT EXISTS veredictos (
         hipotesis_id INTEGER PRIMARY KEY, veredicto TEXT, mecanismo TEXT,
         a_favor TEXT, en_contra TEXT, modelo TEXT)""")
@@ -38,11 +46,8 @@ def conexion():
 
 
 def registrar(accion: str):
-    """Log de uso: cada interacción queda registrada (sirve además como
-    'registro de sesión real' del informe)."""
     con = conexion()
-    con.execute("""CREATE TABLE IF NOT EXISTS registro_uso (
-        ts TEXT, accion TEXT)""")
+    con.execute("CREATE TABLE IF NOT EXISTS registro_uso (ts TEXT, accion TEXT)")
     con.execute("INSERT INTO registro_uso VALUES (?,?)",
                 (datetime.now().isoformat(timespec="seconds"), accion))
     con.commit()
@@ -51,8 +56,6 @@ def registrar(accion: str):
 
 def guardar_feedback(hid: int, valor: str):
     con = conexion()
-    con.execute("""CREATE TABLE IF NOT EXISTS feedback (
-        hipotesis_id INTEGER PRIMARY KEY, valor TEXT, ts TEXT)""")
     con.execute("INSERT OR REPLACE INTO feedback VALUES (?,?,?)",
                 (hid, valor, datetime.now().isoformat(timespec="seconds")))
     con.commit()
@@ -82,6 +85,75 @@ def contar_pubmed_vivo(a: str, b: str) -> int:
     return int(ET.fromstring(r.text).findtext("Count"))
 
 
+# ── LLM en vivo (Gemini, capa gratuita) ────────────────────────────────────
+def clave_llm() -> str:
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:  # sin archivo de secrets (p. ej. entorno local limpio)
+        return ""
+
+
+def hay_llm() -> bool:
+    return bool(clave_llm())
+
+
+def llm_disponibles() -> int:
+    usados = st.session_state.get("llm_usos", 0)
+    return max(0, MAX_LLM_POR_SESION - usados)
+
+
+def gemini(prompt: str) -> str | None:
+    """Llamada a Gemini con tope por sesión. Devuelve None si no se puede."""
+    if not hay_llm() or llm_disponibles() <= 0:
+        return None
+    key = clave_llm()
+    for modelo in ("gemini-2.5-flash", "gemini-2.0-flash"):
+        try:
+            r = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{modelo}:generateContent",
+                params={"key": key},
+                json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 0.4,
+                                           "maxOutputTokens": 900}},
+                timeout=60)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            partes = r.json()["candidates"][0]["content"]["parts"]
+            st.session_state["llm_usos"] = st.session_state.get("llm_usos", 0) + 1
+            return " ".join(p.get("text", "") for p in partes).strip()
+        except requests.RequestException:
+            return None
+    return None
+
+
+def evidencia_de_hipotesis(con, hid: int) -> str:
+    """Texto de contexto (cadenas + frases textuales) para anclar al LLM."""
+    h = con.execute("SELECT * FROM hipotesis WHERE id=?", (hid,)).fetchone()
+    lineas = [f"HIPÓTESIS: «{h['a']}» ⇒ «{h['b']}» (tipo: {h['tipo']}, "
+              f"papers pre-2014 que los co-mencionan: {h['pubmed_pre2014']}, "
+              f"hoy: {h['pubmed_total']})"]
+    v = con.execute("SELECT * FROM veredictos WHERE hipotesis_id=?", (hid,)).fetchone()
+    if v:
+        lineas.append(f"VEREDICTO DEL ESCÉPTICO: {v['veredicto']} — {v['mecanismo']} "
+                      f"| A favor: {v['a_favor']} | En contra: {v['en_contra']}")
+    for p in con.execute("SELECT * FROM puentes WHERE hipotesis_id=? LIMIT 4",
+                         (hid,)):
+        lineas.append(f"PUENTE vía «{p['c']}» (signos {p['s1']},{p['s2']}, "
+                      f"{p['orientacion']}):")
+        for pmid in (p["pmids_lado_a"].split(",")[:2] +
+                     p["pmids_lado_b"].split(",")[:2]):
+            fila = con.execute(
+                "SELECT sujeto, relacion, objeto, frase FROM relaciones_norm "
+                "WHERE pmid=? AND (sujeto=? OR objeto=?) LIMIT 1",
+                (pmid, p["c"], p["c"])).fetchone()
+            if fila:
+                lineas.append(f'  - «{fila["sujeto"]}» {fila["relacion"]} '
+                              f'«{fila["objeto"]}» (PMID {pmid}): "{fila["frase"]}"')
+    return "\n".join(lineas)
+
+
 # ── encabezado ─────────────────────────────────────────────────────────────
 st.title("🔗 NEXO")
 st.caption("Hipótesis científicas a partir de conexiones no exploradas en la literatura")
@@ -108,141 +180,304 @@ with st.sidebar:
     c2.metric("Relaciones", e["relaciones"])
     c1.metric("Conceptos", e["nodos"])
     c2.metric("Hipótesis", e["hipotesis"])
-
     st.divider()
-    solo_beneficio = st.checkbox("Solo las que se oponen al blanco (posible beneficio)",
-                                 value=False)
-    solo_sobrevive = st.checkbox("Solo las que superaron al escéptico", value=False)
+    solo_beneficio = st.checkbox("Solo las que se oponen al blanco (posible beneficio)")
+    solo_sobrevive = st.checkbox("Solo las que superaron al escéptico")
+    if hay_llm():
+        st.divider()
+        st.caption(f"🤖 Consultas al LLM disponibles en esta sesión: "
+                   f"{llm_disponibles()}/{MAX_LLM_POR_SESION}")
 
-# ── lista de hipótesis ─────────────────────────────────────────────────────
 con = conexion()
-consulta = """
-    SELECT h.*, v.veredicto FROM hipotesis h
-    LEFT JOIN veredictos v ON v.hipotesis_id = h.id WHERE 1=1"""
-if solo_beneficio:
-    consulta += " AND h.tipo='opuesto'"
-if solo_sobrevive:
-    consulta += " AND v.veredicto='sobrevive'"
-consulta += " ORDER BY h.score DESC LIMIT 50"
-hipotesis = con.execute(consulta).fetchall()
-
-col_lista, col_detalle = st.columns([2, 3], gap="large")
-
 ICONO = {"sobrevive": "✅", "dudosa": "🤔", "refutada": "❌", None: "⏳"}
 
-with col_lista:
-    st.subheader(f"Hipótesis ({len(hipotesis)})")
-    opciones = {
-        f"{ICONO[h['veredicto']]} {h['a']}  ⇒  {h['b']}   ·  "
-        f"{h['n_puentes']} puente(s)": h["id"]
-        for h in hipotesis}
-    if not opciones:
-        st.info("No hay hipótesis con esos filtros.")
-        st.stop()
-    # ?hip=<id> permite linkear directo a una hipótesis (y compartirla)
-    try:
-        hip_param = int(st.query_params.get("hip", -1))
-    except ValueError:
-        hip_param = -1
-    indice = (list(opciones.values()).index(hip_param)
-              if hip_param in opciones.values() else 0)
-    eleccion = st.radio("Elegí una para ver el detalle:",
-                        list(opciones), index=indice,
-                        label_visibility="collapsed")
-    hid = opciones[eleccion]
+tab_h, tab_g, tab_d = st.tabs(
+    ["📋 Hipótesis", "🔎 Explorar el grafo", "🧪 Descubrí vos"])
 
-# ── detalle ────────────────────────────────────────────────────────────────
-h = con.execute("""SELECT h.*, v.veredicto, v.mecanismo, v.a_favor, v.en_contra
-                   FROM hipotesis h LEFT JOIN veredictos v
-                   ON v.hipotesis_id=h.id WHERE h.id=?""", (hid,)).fetchone()
-registrar(f"ver:hipotesis={hid}:{h['a']}=>{h['b']}")
+# ═══════════════════════════════════════════════ TAB 1: HIPÓTESIS
+with tab_h:
+    consulta = """
+        SELECT h.*, v.veredicto FROM hipotesis h
+        LEFT JOIN veredictos v ON v.hipotesis_id = h.id WHERE 1=1"""
+    if solo_beneficio:
+        consulta += " AND h.tipo='opuesto'"
+    if solo_sobrevive:
+        consulta += " AND v.veredicto='sobrevive'"
+    consulta += " ORDER BY h.score DESC LIMIT 50"
+    hipotesis = con.execute(consulta).fetchall()
 
-with col_detalle:
-    st.subheader(f"{h['a']}  ⇒  {h['b']}")
-    if h["tipo"] == "opuesto":
-        tipo_txt = ("actuaría en sentido **opuesto** a **{b}** — si el blanco es "
-                    "una patología o proceso dañino, sugiere un posible beneficio")
-    else:
-        tipo_txt = ("actuaría en el **mismo sentido** que **{b}** — si el blanco "
-                    "es un fármaco, sugiere un efecto similar; si es una "
-                    "patología, un posible riesgo")
-    st.markdown(f"Hipótesis: **{h['a']}** " + tipo_txt.format(b=h["b"]) +
-                f". Los dos conceptos **nunca aparecen juntos** en el corpus.")
+    col_lista, col_detalle = st.columns([2, 3], gap="large")
 
-    # novedad
-    st.markdown("##### Novedad")
-    n1, n2, n3 = st.columns([1, 1, 2])
-    n1.metric("Papers juntos pre-2014", h["pubmed_pre2014"]
-              if h["pubmed_pre2014"] is not None else "—")
-    n2.metric("Papers juntos hoy", h["pubmed_total"]
-              if h["pubmed_total"] is not None else "—")
-    pre, tot = h["pubmed_pre2014"], h["pubmed_total"]
-    if pre is not None and tot and tot >= 50 and pre * 20 <= tot:
-        n3.success(f"★ Redescubrimiento: al corte casi no había literatura "
-                   f"conjunta ({pre} papers) y hoy hay {tot}. El sistema "
-                   f"encontró la conexión antes de poder leerla.")
-    if n3.button("🔄 Re-chequear novedad en PubMed (en vivo)"):
+    with col_lista:
+        st.subheader(f"Hipótesis ({len(hipotesis)})")
+        opciones = {
+            f"{ICONO[h['veredicto']]} {h['a']}  ⇒  {h['b']}   ·  "
+            f"{h['n_puentes']} puente(s)": h["id"]
+            for h in hipotesis}
+        if not opciones:
+            st.info("No hay hipótesis con esos filtros.")
+            st.stop()
         try:
-            vivo = contar_pubmed_vivo(h["a"], h["b"])
-            n3.info(f"PubMed hoy: {vivo} papers que mencionan ambos.")
-            registrar(f"novedad_viva:hipotesis={hid}:{vivo}")
-        except Exception:
-            n3.error("PubMed no respondió; probá de nuevo.")
+            hip_param = int(st.query_params.get("hip", -1))
+        except ValueError:
+            hip_param = -1
+        indice = (list(opciones.values()).index(hip_param)
+                  if hip_param in opciones.values() else 0)
+        eleccion = st.radio("Elegí una para ver el detalle:",
+                            list(opciones), index=indice,
+                            label_visibility="collapsed")
+        hid = opciones[eleccion]
 
-    # veredicto del escéptico
-    st.markdown("##### Veredicto del escéptico")
-    if h["veredicto"]:
-        st.markdown(f"{ICONO[h['veredicto']]} **{h['veredicto'].upper()}** — "
-                    f"*{h['mecanismo']}*")
-        cf, cc = st.columns(2)
-        cf.success(f"**A favor:** {h['a_favor']}")
-        cc.error(f"**En contra:** {h['en_contra']}")
-    else:
-        st.caption("Esta hipótesis aún no fue evaluada por el agente escéptico.")
+    h = con.execute("""SELECT h.*, v.veredicto, v.mecanismo, v.a_favor, v.en_contra
+                       FROM hipotesis h LEFT JOIN veredictos v
+                       ON v.hipotesis_id=h.id WHERE h.id=?""", (hid,)).fetchone()
+    registrar(f"ver:hipotesis={hid}:{h['a']}=>{h['b']}")
 
-    # puentes con evidencia trazable
-    st.markdown("##### Puentes y evidencia")
-    puentes = con.execute(
-        "SELECT * FROM puentes WHERE hipotesis_id=? ORDER BY producto LIMIT 8",
-        (hid,)).fetchall()
-    for p in puentes:
-        flecha1 = "↑" if p["s1"] > 0 else "↓"
-        flecha2 = "↑" if p["s2"] > 0 else "↓"
-        titulo = (f"{h['a']} {flecha1} → **{p['c']}** → {flecha2} {h['b']}"
-                  if p["orientacion"] == "C→B" else
-                  f"{h['a']} {flecha1} → **{p['c']}** ← {flecha2} {h['b']}")
-        with st.expander(titulo):
-            for lado, pmids in (("lado A", p["pmids_lado_a"]),
-                                ("lado B", p["pmids_lado_b"])):
-                for pmid in pmids.split(",")[:3]:
-                    fila = con.execute(
-                        """SELECT sujeto, relacion, objeto, frase
-                           FROM relaciones_norm WHERE pmid=? AND
-                           (sujeto=? OR objeto=? OR sujeto=? OR objeto=?)
-                           LIMIT 1""",
-                        (pmid, p["c"], p["c"], h["a"], h["b"])).fetchone()
-                    if fila:
-                        st.markdown(
-                            f"- ({lado}) «{fila['sujeto']}» *{fila['relacion']}* "
-                            f"«{fila['objeto']}» — "
-                            f"[PMID {pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
-                        st.caption(f"“{fila['frase']}”")
+    with col_detalle:
+        st.subheader(f"{h['a']}  ⇒  {h['b']}")
+        if h["tipo"] == "opuesto":
+            tipo_txt = ("actuaría en sentido **opuesto** a **{b}** — si el blanco "
+                        "es una patología o proceso dañino, sugiere un posible "
+                        "beneficio")
+        else:
+            tipo_txt = ("actuaría en el **mismo sentido** que **{b}** — si el "
+                        "blanco es un fármaco, sugiere un efecto similar; si es "
+                        "una patología, un posible riesgo")
+        st.markdown(f"Hipótesis: **{h['a']}** " + tipo_txt.format(b=h["b"]) +
+                    f". Los dos conceptos **nunca aparecen juntos** en el corpus.")
 
-    # feedback del experto (la memoria que persiste)
-    st.markdown("##### Tu evaluación")
-    fb = con.execute("SELECT valor FROM feedback WHERE hipotesis_id=?",
-                     (hid,)).fetchone()
-    if fb:
-        st.info(f"Ya la marcaste como: **{fb['valor']}**")
-    b1, b2, b3 = st.columns(3)
-    if b1.button("👍 Prometedora"):
-        guardar_feedback(hid, "prometedora")
-        st.rerun()
-    if b2.button("👎 Descartar"):
-        guardar_feedback(hid, "descartada")
-        st.rerun()
-    if b3.button("🤷 Ya se sabía"):
-        guardar_feedback(hid, "conocida")
-        st.rerun()
+        st.markdown("##### Novedad")
+        n1, n2, n3 = st.columns([1, 1, 2])
+        n1.metric("Papers juntos pre-2014", h["pubmed_pre2014"]
+                  if h["pubmed_pre2014"] is not None else "—")
+        n2.metric("Papers juntos hoy", h["pubmed_total"]
+                  if h["pubmed_total"] is not None else "—")
+        pre, tot = h["pubmed_pre2014"], h["pubmed_total"]
+        if pre is not None and tot and tot >= 50 and pre * 20 <= tot:
+            n3.success(f"★ Redescubrimiento: al corte casi no había literatura "
+                       f"conjunta ({pre} papers) y hoy hay {tot}. El sistema "
+                       f"encontró la conexión antes de poder leerla.")
+        if n3.button("🔄 Re-chequear novedad en PubMed (en vivo)"):
+            try:
+                vivo = contar_pubmed_vivo(h["a"], h["b"])
+                n3.info(f"PubMed hoy: {vivo} papers que mencionan ambos.")
+                registrar(f"novedad_viva:hipotesis={hid}:{vivo}")
+            except Exception:
+                n3.error("PubMed no respondió; probá de nuevo.")
+
+        st.markdown("##### Veredicto del escéptico")
+        if h["veredicto"]:
+            st.markdown(f"{ICONO[h['veredicto']]} **{h['veredicto'].upper()}** — "
+                        f"*{h['mecanismo']}*")
+            cf, cc = st.columns(2)
+            cf.success(f"**A favor:** {h['a_favor']}")
+            cc.error(f"**En contra:** {h['en_contra']}")
+        else:
+            st.caption("Esta hipótesis aún no fue evaluada por el agente escéptico.")
+
+        st.markdown("##### Puentes y evidencia")
+        puentes = con.execute(
+            "SELECT * FROM puentes WHERE hipotesis_id=? ORDER BY producto LIMIT 8",
+            (hid,)).fetchall()
+        for p in puentes:
+            f1 = "↑" if p["s1"] > 0 else "↓"
+            f2 = "↑" if p["s2"] > 0 else "↓"
+            titulo = (f"{h['a']} {f1} → **{p['c']}** → {f2} {h['b']}"
+                      if p["orientacion"] == "C→B" else
+                      f"{h['a']} {f1} → **{p['c']}** ← {f2} {h['b']}")
+            with st.expander(titulo):
+                for lado, pmids in (("lado A", p["pmids_lado_a"]),
+                                    ("lado B", p["pmids_lado_b"])):
+                    for pmid in pmids.split(",")[:3]:
+                        fila = con.execute(
+                            """SELECT sujeto, relacion, objeto, frase
+                               FROM relaciones_norm WHERE pmid=? AND
+                               (sujeto=? OR objeto=? OR sujeto=? OR objeto=?)
+                               LIMIT 1""",
+                            (pmid, p["c"], p["c"], h["a"], h["b"])).fetchone()
+                        if fila:
+                            st.markdown(
+                                f"- ({lado}) «{fila['sujeto']}» *{fila['relacion']}* "
+                                f"«{fila['objeto']}» — "
+                                f"[PMID {pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
+                            st.caption(f"“{fila['frase']}”")
+
+        # ── LLM en vivo: interrogar la evidencia ──────────────────────────
+        st.markdown("##### 💬 Interrogá la evidencia (LLM en vivo)")
+        if not hay_llm():
+            st.caption("Función no disponible: falta configurar la API key del "
+                       "LLM en los Secrets del despliegue.")
+        elif llm_disponibles() <= 0:
+            st.caption("Se agotaron las consultas al LLM de esta sesión "
+                       "(recargá la página para renovarlas).")
+        else:
+            pregunta = st.text_input(
+                "Preguntale a NEXO sobre esta hipótesis",
+                placeholder="¿Qué experimento haría falta para confirmarla? "
+                            "¿Por qué dudó el escéptico?",
+                key=f"preg_{hid}")
+            if st.button("Preguntar", key=f"btn_preg_{hid}") and pregunta.strip():
+                contexto = evidencia_de_hipotesis(con, hid)
+                respuesta = gemini(
+                    "Sos el asistente de NEXO, un sistema que propone hipótesis "
+                    "científicas conectando literatura. Respondé la pregunta del "
+                    "usuario SOLO con base en la evidencia de abajo; si algo no "
+                    "está en la evidencia, decilo explícitamente. Sé conciso "
+                    "(máximo 2 párrafos), en español.\n\n=== EVIDENCIA ===\n"
+                    f"{contexto}\n\n=== PREGUNTA ===\n{pregunta}")
+                registrar(f"llm_pregunta:hipotesis={hid}")
+                if respuesta:
+                    st.info(respuesta)
+                else:
+                    st.error("El LLM no respondió (límite de la capa gratuita "
+                             "o error de red). Probá en un momento.")
+
+        st.markdown("##### Tu evaluación")
+        fb = con.execute("SELECT valor FROM feedback WHERE hipotesis_id=?",
+                         (hid,)).fetchone()
+        if fb:
+            st.info(f"Ya la marcaste como: **{fb['valor']}**")
+        b1, b2, b3 = st.columns(3)
+        if b1.button("👍 Prometedora"):
+            guardar_feedback(hid, "prometedora")
+            st.rerun()
+        if b2.button("👎 Descartar"):
+            guardar_feedback(hid, "descartada")
+            st.rerun()
+        if b3.button("🤷 Ya se sabía"):
+            guardar_feedback(hid, "conocida")
+            st.rerun()
+
+# ═══════════════════════════════════════════════ TAB 2: EXPLORAR EL GRAFO
+with tab_g:
+    st.subheader("Buscá cualquier concepto del grafo")
+    q = st.text_input("Concepto", placeholder="natriuresis, dapagliflozin, "
+                      "blood pressure…", key="busqueda")
+    if q.strip():
+        registrar(f"buscar:{q.strip()[:60]}")
+        nodos = con.execute(
+            "SELECT nombre, menciones FROM nodos WHERE nombre LIKE ? "
+            "ORDER BY menciones DESC LIMIT 15", (f"%{q.strip().lower()}%",)
+        ).fetchall()
+        if not nodos:
+            st.info("Ningún concepto del grafo coincide con esa búsqueda.")
+        else:
+            elegido = st.selectbox(
+                "Conceptos que coinciden",
+                [f"{n['nombre']}  ·  {n['menciones']} menciones" for n in nodos])
+            nodo = elegido.split("  ·")[0]
+            st.markdown(f"#### Relaciones de «{nodo}»")
+            filas = con.execute(
+                """SELECT sujeto, relacion, objeto, pmid, frase
+                   FROM relaciones_norm WHERE sujeto=? OR objeto=?
+                   ORDER BY pmid DESC LIMIT 25""", (nodo, nodo)).fetchall()
+            for f in filas:
+                with st.expander(f"«{f['sujeto']}» {f['relacion']} «{f['objeto']}»"
+                                 f"  — PMID {f['pmid']}"):
+                    st.caption(f"“{f['frase']}”")
+                    st.markdown(f"[Ver paper en PubMed]"
+                                f"(https://pubmed.ncbi.nlm.nih.gov/{f['pmid']}/)")
+            hs = con.execute(
+                """SELECT DISTINCT h.id, h.a, h.b, h.tipo FROM hipotesis h
+                   LEFT JOIN puentes p ON p.hipotesis_id = h.id
+                   WHERE h.a=? OR h.b=? OR p.c=? LIMIT 10""",
+                (nodo, nodo, nodo)).fetchall()
+            if hs:
+                st.markdown(f"#### Hipótesis en las que participa")
+                for hh in hs:
+                    st.markdown(f"- [{hh['a']} ⇒ {hh['b']}](?hip={hh['id']}) "
+                                f"({hh['tipo']})")
+
+# ═══════════════════════════════════════════════ TAB 3: DESCUBRÍ VOS
+with tab_d:
+    st.subheader("Elegí dos conceptos y NEXO busca puentes en vivo")
+    st.caption("El mismo método del sistema, pero manejado por vos: caminos "
+               "A→C→B con signos coherentes, novedad en PubMed y análisis del LLM.")
+    candidatos = [r["nombre"] for r in con.execute(
+        "SELECT nombre FROM nodos WHERE menciones >= 3 ORDER BY menciones DESC")]
+    ca, cb = st.columns(2)
+    nodo_a = ca.selectbox("Concepto A (por ej. un fármaco o intervención)",
+                          candidatos, index=None,
+                          placeholder="escribí para buscar…")
+    nodo_b = cb.selectbox("Concepto B (por ej. una enfermedad o proceso)",
+                          candidatos, index=None,
+                          placeholder="escribí para buscar…")
+
+    if st.button("🧪 Buscar puentes", disabled=not (nodo_a and nodo_b)) \
+            and nodo_a and nodo_b and nodo_a != nodo_b:
+        registrar(f"descubrir:{nodo_a}×{nodo_b}")
+        # aristas firmadas alrededor de A y de B
+        desde_a = defaultdict(list)
+        for f in con.execute(
+                "SELECT objeto, signo, pmid, frase, relacion FROM relaciones_norm "
+                "WHERE sujeto=? AND signo != 0", (nodo_a,)):
+            desde_a[f["objeto"]].append(f)
+        lado_b = defaultdict(list)
+        for f in con.execute(
+                "SELECT sujeto AS otro, signo, pmid, frase, relacion, 'C→B' AS ori "
+                "FROM relaciones_norm WHERE objeto=? AND signo != 0 "
+                "UNION ALL "
+                "SELECT objeto, signo, pmid, frase, relacion, 'B→C' "
+                "FROM relaciones_norm WHERE sujeto=? AND signo != 0",
+                (nodo_b, nodo_b)):
+            lado_b[f["otro"]].append(f)
+
+        puentes_c = sorted(set(desde_a) & set(lado_b) - {nodo_a, nodo_b})
+        if not puentes_c:
+            st.info("No hay puentes con relaciones firmadas entre esos dos "
+                    "conceptos en el corpus. Probá con conceptos más "
+                    "mencionados (el grafo se limita a 2 dominios pre-2013).")
+        else:
+            st.success(f"{len(puentes_c)} puente(s) encontrados")
+            resumen = []
+            for c in puentes_c[:6]:
+                e1, e2 = desde_a[c][0], lado_b[c][0]
+                f1 = "↑" if e1["signo"] > 0 else "↓"
+                f2 = "↑" if e2["signo"] > 0 else "↓"
+                flecha = "→" if e2["ori"] == "C→B" else "←"
+                with st.expander(f"{nodo_a} {f1} → **{c}** {flecha} {f2} {nodo_b}"):
+                    st.markdown(f"- «{nodo_a}» *{e1['relacion']}* «{c}» — "
+                                f"[PMID {e1['pmid']}]"
+                                f"(https://pubmed.ncbi.nlm.nih.gov/{e1['pmid']}/)")
+                    st.caption(f"“{e1['frase']}”")
+                    st.markdown(f"- lado B ({e2['ori']}): *{e2['relacion']}* — "
+                                f"[PMID {e2['pmid']}]"
+                                f"(https://pubmed.ncbi.nlm.nih.gov/{e2['pmid']}/)")
+                    st.caption(f"“{e2['frase']}”")
+                resumen.append(
+                    f"puente «{c}»: «{nodo_a}» {e1['relacion']} «{c}» "
+                    f'("{e1["frase"][:140]}"); lado B ({e2["ori"]}): '
+                    f'«{nodo_b if e2["ori"] == "B→C" else c}» {e2["relacion"]} '
+                    f'«{c if e2["ori"] == "B→C" else nodo_b}» ("{e2["frase"][:140]}")')
+
+            try:
+                vivo = contar_pubmed_vivo(nodo_a, nodo_b)
+                st.metric("Papers en PubMed que ya mencionan ambos (hoy, en vivo)",
+                          vivo)
+            except Exception:
+                vivo = None
+
+            if hay_llm() and llm_disponibles() > 0:
+                with st.spinner("El LLM analiza los puentes…"):
+                    analisis = gemini(
+                        "Sos el analista de NEXO. Un usuario propuso conectar "
+                        f"«{nodo_a}» con «{nodo_b}». Los puentes encontrados en "
+                        "papers reales (anteriores a 2013) son:\n\n"
+                        + "\n".join(resumen[:5]) +
+                        f"\n\nPapers actuales en PubMed que ya mencionan ambos: "
+                        f"{vivo if vivo is not None else 'desconocido'}.\n\n"
+                        "Respondé en español, conciso: (1) la hipótesis que "
+                        "surge, en una frase; (2) el mecanismo propuesto; (3) una "
+                        "crítica escéptica honesta (¿qué debilita esta cadena?); "
+                        "(4) si los papers actuales son muchos, aclarar que ya "
+                        "no sería novedosa. Basate SOLO en la evidencia dada.")
+                if analisis:
+                    st.markdown("#### 🤖 Análisis del LLM")
+                    st.info(analisis)
+                else:
+                    st.caption("El LLM no respondió (límite o error de red).")
+            elif not hay_llm():
+                st.caption("Análisis del LLM no disponible: falta configurar la "
+                           "API key en los Secrets del despliegue.")
 
 con.close()
